@@ -27,7 +27,11 @@ def main():
                     _, pid = line.split()
                     print("My player id:", pid)
                 elif line.startswith("POS"):
-                    pass  # for now just print it
+                    parts = line.split()
+                    if len(parts) == 4:
+                        _, pid_msg, x_str, y_str = parts
+                        print(f"Player {pid_msg} at ({x_str}, {y_str})")
+
 
             cmd = input("Move (W A S D, or Q to quit): ").strip().upper()
             if cmd == "Q":

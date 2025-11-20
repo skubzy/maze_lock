@@ -16,10 +16,13 @@ class GameState:
         self.cols = cols
         self.maze = maze          # 2D list
         self.players = {}         # player_id -> [x, y]
+        self.conns = {}           # player_id -> socket
         self.next_id = 1
         self.lock = threading.Lock()
 
+
     def add_player(self):
+        # create a new player at starting position 1,1
         with self.lock:
             pid = f"p{self.next_id}"
             self.next_id += 1
@@ -27,20 +30,48 @@ class GameState:
             return pid, 1, 1
 
     def move_player(self, pid, dx, dy):
+        # move the player if the target cell is inside maze and not a wall
         with self.lock:
             x, y = self.players[pid]
             nx = x + dx
             ny = y + dy
 
+            # check bounds of maze
             if not (0 <= nx < self.cols and 0 <= ny < self.rows):
                 return x, y
 
             cell = self.maze[ny][nx]
+
+            # wall is value 1 so do not move
             if cell == 1:
                 return x, y
 
+            # movement is allowed
             self.players[pid] = [nx, ny]
             return nx, ny
+
+def broadcast_positions(game_state):
+    with game_state.lock:
+        lines = []
+        for pid, (x, y) in game_state.players.items():
+            lines.append(f"POS {pid} {x} {y}")
+        msg = "\n".join(lines) + "\n"
+
+        dead = []
+        for pid, conn in game_state.conns.items():
+            try:
+                conn.sendall(msg.encode())
+            except OSError:
+                dead.append(pid)
+
+        for pid in dead:
+            conn = game_state.conns.pop(pid, None)
+            game_state.players.pop(pid, None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
 
 
 
@@ -62,8 +93,20 @@ def handle_client(conn, addr, game_state):
 
                 if text == "JOIN" and pid is None:
                     pid, x, y = game_state.add_player()
+                    with game_state.lock:
+                        game_state.conns[pid] = conn
+
                     conn.sendall(f"WELCOME {pid}\n".encode())
                     conn.sendall(f"SPAWN {x} {y}\n".encode())
+
+                    # send maze rows to this client
+                    with game_state.lock:
+                        for row in game_state.maze:
+                            row_str = "".join(str(c) for c in row)
+                            conn.sendall(f"MAZEROW {row_str}\n".encode())
+
+                    broadcast_positions(game_state)
+
 
                 elif text.startswith("MOVE") and pid is not None:
                     parts = text.split()
@@ -82,11 +125,21 @@ def handle_client(conn, addr, game_state):
                         dx, dy = 1, 0
 
                     x, y = game_state.move_player(pid, dx, dy)
-                    conn.sendall(f"POS {x} {y}\n".encode())
+                    broadcast_positions(game_state)
 
     finally:
         print("Client disconnected", addr)
-        conn.close()
+        with game_state.lock:
+            if pid in game_state.conns:
+                del game_state.conns[pid]
+            if pid in game_state.players:
+                del game_state.players[pid]
+        try:
+            conn.close()
+        except OSError:
+            pass
+        broadcast_positions(game_state)
+
 
 
 def generate_maze(rows, cols):
