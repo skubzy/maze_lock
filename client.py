@@ -1,7 +1,7 @@
 import socket, time, statistics
 import threading, random
 
-HOST = "127.0.0.1"
+HOST = "10.194.105.40"
 PORT = 5001
 def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as c:
