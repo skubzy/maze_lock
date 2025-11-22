@@ -1,7 +1,7 @@
 import socket
 import pygame
 
-HOST = "192.168.9.125"
+HOST = "127.0.0.1"
 PORT = 5001
 
 WINDOW_SIZE = 790           # square window
