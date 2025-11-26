@@ -19,6 +19,9 @@ class GameState:
         # door positions as a set of (x, y)
         self.doors = set(doors)
 
+        #Timer initialization- these will be used to manage door locking, they will wait until timer is complete before allowing another player to use the door
+        self.door_lock_until = {pos: 0.0 for pos in self.doors}
+
         # door position -> occupant player id or None
         self.door_occupant = {pos: None for pos in self.doors}
 
@@ -32,22 +35,37 @@ class GameState:
             self.next_id += 1
             self.players[pid] = [1, 1]
             return pid, 1, 1
-
+    
+    
     def move_player(self, pid, dx, dy):
         """
-        Move player and return
-        (new_x, new_y, tile_updates)
+        Timer starts when FIRST player ENTERS the door.
 
-        tile_updates is a list of (x, y, new_value) to send to clients.
+        - First player enters door:
+            * red area appears (door + nearby paths)
+            * 5s timer starts
+        - During those 5s:
+            * only that player can stand on the door tile
+            * everyone else is blocked from the door
+        - After 5s:
+            * red tiles are cleared
+            * door is removed, path becomes normal
         """
         with self.lock:
+            now = time.time()
+
+            # clear any doors whose timer expired
+            tile_updates = self.refresh_doors(now)
+
+            # if somehow pid vanished, just do nothing but still return correctly
+            if pid not in self.players:
+                return 0, 0, tile_updates
+
             x, y = self.players[pid]
             nx = x + dx
             ny = y + dy
 
-            tile_updates = []
-
-            # check bounds of maze
+            # check bounds
             if not (0 <= nx < self.cols and 0 <= ny < self.rows):
                 return x, y, tile_updates
 
@@ -57,15 +75,21 @@ class GameState:
             current_cell = self.maze[y][x]
             target_cell = self.maze[ny][nx]
 
-            # is current or target a door position
             current_is_door = current_pos in self.doors
             target_is_door = target_pos in self.doors
 
-            # helper to check if a door tile is free for this player
+            # helper: can this player enter target door tile?
             def door_is_free(door_pos, player_id):
-                if door_pos not in self.door_occupant:
+                lock_until = self.door_lock_until.get(door_pos, 0.0)
+                occ = self.door_occupant.get(door_pos)
+
+                # timer active -> locked for everyone except occupant
+                if lock_until and now < lock_until:
+                    if occ == player_id:
+                        return True
                     return False
-                occ = self.door_occupant[door_pos]
+
+                # no timer -> free if no occupant or same player
                 if occ is None:
                     return True
                 return occ == player_id
@@ -74,65 +98,195 @@ class GameState:
             if target_cell == 1:
                 return x, y, tile_updates
 
-            # door logic
+            # entering a door tile
             if target_is_door:
                 if not door_is_free(target_pos, pid):
-                    # another player is inside this door area
+                    # locked for this player
                     return x, y, tile_updates
 
             # movement allowed
             self.players[pid] = [nx, ny]
 
-            # if we left a door, and moved to a tile that is not the same door
-            if current_is_door and current_pos != target_pos:
-                # this player was inside this door
-                if self.door_occupant.get(current_pos) == pid:
-                    # clear highlights and remove the door completely
-                    highlights = self.door_highlights.get(current_pos, [])
-                    for hx, hy in highlights:
-                        # return tiles to normal path
-                        self.maze[hy][hx] = 0
-                        tile_updates.append((hx, hy, 0))
+            # we do NOT start timer on leaving in this option,
+            # only on first ENTER, so nothing special needed here
+            # when current_is_door and current_pos != target_pos.
 
-                    # remove door data
-                    self.door_occupant.pop(current_pos, None)
-                    self.door_highlights.pop(current_pos, None)
-                    if current_pos in self.doors:
-                        self.doors.remove(current_pos)
-
-            # if we entered a door
+            # if we entered a door for the first time, start timer + build red area
             if target_is_door:
-                # if nobody was in it before, this is the first player
-                if self.door_occupant[target_pos] is None:
+                # only if no timer already running and no occupant yet
+                if (self.door_occupant.get(target_pos) is None and
+                        self.door_lock_until.get(target_pos, 0.0) == 0.0):
+
+                    # this player owns the door
                     self.door_occupant[target_pos] = pid
 
-                    # compute up to three closest path tiles around the door
+                    # start 5 second lock timer immediately
+                    self.door_lock_until[target_pos] = now + 5.0
+
+                    # we want up to five red tiles total
+                    max_red = 5  # door + nearby paths
+
                     dxdy = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-                    highlights = [target_pos]  # include door tile itself
+                    highlights = [target_pos]          # include door tile
+                    visited = {target_pos}
+                    queue = [target_pos]
 
-                    for ddx, ddy in dxdy:
-                        if len(highlights) >= 4:  # door plus three paths
-                            break
-                        sx = nx + ddx
-                        sy = ny + ddy
-                        if 0 <= sx < self.cols and 0 <= sy < self.rows:
-                            if self.maze[sy][sx] == 0:  # only path tiles
-                                highlights.append((sx, sy))
+                    # BFS around the door to find nearby path tiles
+                    while len(highlights) < max_red and queue:
+                        cx, cy = queue.pop(0)
 
-                    # store highlights for this door
+                        for ddx, ddy in dxdy:
+                            sx = cx + ddx
+                            sy = cy + ddy
+
+                            if not (0 <= sx < self.cols and 0 <= sy < self.rows):
+                                continue
+                            pos = (sx, sy)
+                            if pos in visited:
+                                continue
+                            visited.add(pos)
+
+                            cell_here = self.maze[sy][sx]
+
+                            # only normal path tiles become extra red tiles
+                            if cell_here == 0:
+                                highlights.append(pos)
+                                queue.append(pos)
+
+                            # do not cross walls / exit / other doors
+
+                    # remember which tiles belong to this door's red zone
                     self.door_highlights[target_pos] = highlights
 
-                    # mark them as red tiles (value 4) in maze
+                    # paint them red (4) and report updates
                     for hx, hy in highlights:
                         self.maze[hy][hx] = 4
                         tile_updates.append((hx, hy, 4))
 
-                else:
-                    # door already in use by same player, do nothing special
-                    pass
-
             return nx, ny, tile_updates
 
+#for if we want to use option 2 instead when the timer starts right away when entering the door
+        #     def move_player(self, pid, dx, dy):
+        # """
+        # Option 2:
+        # - First player enters door -> red area appears AND 5s timer starts.
+        # - First player can move around freely (through red tiles).
+        # - For 5s the door stays locked and red.
+        # - After 5s, red disappears and other players can go through,
+        #   even if the first player is still nearby.
+        # """
+        # with self.lock:
+        #     now = time.time()
+
+        #     # first clear any doors whose timer has finished
+        #     tile_updates = self.refresh_doors(now)
+
+        #     x, y = self.players[pid]
+        #     nx = x + dx
+        #     ny = y + dy
+
+        #     # check bounds of maze
+        #     if not (0 <= nx < self.cols and 0 <= ny < self.rows):
+        #         return x, y, tile_updates
+
+        #     current_pos = (x, y)
+        #     target_pos = (nx, ny)
+
+        #     current_cell = self.maze[y][x]
+        #     target_cell = self.maze[ny][nx]
+
+        #     current_is_door = current_pos in self.doors
+        #     target_is_door = target_pos in self.doors
+
+        #     # helper: can this player enter a given door tile?
+        #     def door_is_free(door_pos, player_id):
+        #         lock_until = self.door_lock_until.get(door_pos, 0.0)
+        #         occ = self.door_occupant.get(door_pos)
+
+        #         # timer active -> locked for everyone except occupant
+        #         if lock_until and now < lock_until:
+        #             if occ == player_id:
+        #                 return True
+        #             return False
+
+        #         # no timer -> free if no occupant or same player
+        #         if occ is None:
+        #             return True
+        #         return occ == player_id
+
+        #     # walls always block
+        #     if target_cell == 1:
+        #         return x, y, tile_updates
+
+        #     # entering a door tile
+        #     if target_is_door:
+        #         if not door_is_free(target_pos, pid):
+        #             # locked for this player
+        #             return x, y, tile_updates
+
+        #     # movement allowed
+        #     self.players[pid] = [nx, ny]
+
+        #     # leaving a door: here we do NOT start the timer, because
+        #     # for this option the timer starts on entering.
+        #     # So we only handle first entry below.
+
+        #     # entering a door tile for the first time -> start timer + highlight
+        #     if target_is_door:
+        #         # only if no timer is already running and no occupant
+        #         if (self.door_occupant.get(target_pos) is None and
+        #                 self.door_lock_until.get(target_pos, 0.0) == 0.0):
+        #             self.door_occupant[target_pos] = pid
+
+        #             # start 5 second lock timer immediately
+        #             self.door_lock_until[target_pos] = now + 5.0
+
+        #             # build up to 5 red tiles: door + up to 4 neighbors
+        #             dxdy = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        #             highlights = [target_pos]  # include door tile itself
+
+        #             for ddx, ddy in dxdy:
+        #                 if len(highlights) >= 5:
+        #                     break
+        #                 sx = nx + ddx
+        #                 sy = ny + ddy
+        #                 if 0 <= sx < self.cols and 0 <= sy < self.rows:
+        #                     if self.maze[sy][sx] == 0:  # only normal path tiles
+        #                         highlights.append((sx, sy))
+
+        #             self.door_highlights[target_pos] = highlights
+
+        #             for hx, hy in highlights:
+        #                 self.maze[hy][hx] = 4
+        #                 tile_updates.append((hx, hy, 4))
+
+        #     return nx, ny, tile_updates
+
+
+    def refresh_doors(self, now):
+        """
+        Clear any doors whose timer has expired.
+        Returns a list of (x, y, new_value) tile updates.
+        """
+        tile_updates = []
+
+        for door_pos in list(self.doors):
+            lock_until = self.door_lock_until.get(door_pos, 0.0)
+            if lock_until and now >= lock_until:
+                # timer finished: remove all red tiles and the door itself
+                highlights = self.door_highlights.get(door_pos, [])
+                for hx, hy in highlights:
+                    if self.maze[hy][hx] == 4:   # still red
+                        self.maze[hy][hx] = 0     # back to normal path
+                        tile_updates.append((hx, hy, 0))
+
+                # clean up door data
+                self.door_highlights.pop(door_pos, None)
+                self.door_occupant.pop(door_pos, None)
+                self.door_lock_until[door_pos] = 0.0
+                self.doors.remove(door_pos)
+
+        return tile_updates
 
 def broadcast_positions(game_state):
     with game_state.lock:
@@ -294,7 +448,7 @@ def generate_maze(rows, cols):
             stack.pop()
 
     # limited loops so only a few alternate paths exist
-    MAX_LOOPS = 5
+    MAX_LOOPS = 10
     loops_added = 0
     attempts = rows * cols
 
@@ -331,7 +485,7 @@ def generate_maze(rows, cols):
 
     # place some doors on corridors
     doors = []
-    DOOR_COUNT = 6  # number of shared door objects (independent of path count)
+    DOOR_COUNT = 15  # number of shared door objects (independent of path count)
 
     attempts = rows * cols
     while len(doors) < DOOR_COUNT and attempts > 0:
